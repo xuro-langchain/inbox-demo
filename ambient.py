@@ -1,22 +1,21 @@
 import random 
 import base64
 import asyncio
-from typing import List
+from typing import List, Annotated
 from typing_extensions import TypedDict
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from langchain.schema import Document
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langchain_core.documents import Document
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages 
 from langgraph.prebuilt import ToolNode
-from langgraph.prebuilt.interrupt import HumanInterruptConfig, HumanInterrupt
-from langgraph.types import interrupt, Command, ActionRequest
+from langgraph.prebuilt.interrupt import HumanInterruptConfig, HumanInterrupt, ActionRequest
+from langgraph.types import interrupt, Command
 
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from IPython.display import Image, display
 
 from prompts import (
     get_research_plan_prompt, 
@@ -44,10 +43,10 @@ class GraphState(TypedDict):
     """
     question: str
     research_plan: str
-    search_queries: List[str]
-    documents: List[str]
+    search_queries: list[str]
+    documents: list[Document]
     summary: str
-    messages: List[str]
+    messages: Annotated[list, add_messages]
     error: str
     
 
@@ -104,17 +103,11 @@ config = HumanInterruptConfig(
 )
 
 def generate_markdown(description: str, state: GraphState, diagram: str):
-    markdown = f"""
-    # Instructions
-    {description}
-
-    ## Graph Diagram
-    {diagram}
-
-    ## State Snapshot
-    """
+    markdown = f"# Instructions\n{description}\n\n"
+    # markdown += f"## Graph Diagram\n![Graph Diagram]({diagram})\n\n"
+    markdown += f"## State Snapshot\n"
     for key, value in state.items():
-        markdown += f"- {key}: {value}\n"
+        markdown += f"### {key}\n{value}\n"
     return markdown
 
 # Interrupt Nodes
@@ -122,7 +115,7 @@ async def confirm_research_plan(state: GraphState):
     snapshot = {
         "question": state["question"],
         "research_plan": state["research_plan"],
-        "messages": state["messages"],
+        "messages": state.get("messages", []),
     }
     markdown = generate_markdown(
         "Please review the research plan and approve or provide feedback.", 
@@ -143,21 +136,21 @@ async def confirm_research_plan(state: GraphState):
     elif response.action == "ignore":
         pass
     elif response.action == "respond":
-        return {"research_plan": response["args"]["research_plan"]}
+        return {"research_plan": response["args"]["args"]["research_plan"]}
 
 async def confirm_search_queries(state: GraphState):
     snapshot = {
         "question": state["question"],
-        "research_plan": state["research_plan"],
-        "search_queries": state["search_queries"],
-        "messages": state["messages"],
+        "research_plan": state.get("research_plan", ""),
+        "search_queries": state.get("search_queries", []),
+        "messages": state.get("messages", []),
     }
     markdown = generate_markdown(
         "Please review the search queries and approve or provide feedback.", 
         snapshot, 
         diagram if diagram else "No image available"
     )
-    args = {"search_queries": state["search_queries"]}
+    args = {"search_queries": state.get("search_queries", [])}
     action_request = ActionRequest(action="Review Search Queries", args=args)
     human_interrupt = HumanInterrupt(
         action_request=action_request,
@@ -170,22 +163,22 @@ async def confirm_search_queries(state: GraphState):
     elif response.action == "ignore":
         pass
     elif response.action == "respond":
-        return {"search_queries": response["args"]["search_queries"]}
+        return {"search_queries": response["args"]["args"]["search_queries"]}
 
 async def confirm_search_results(state: GraphState):
     snapshot = {
         "question": state["question"],
-        "research_plan": state["research_plan"],
-        "search_queries": state["search_queries"],
-        "search_results": state["search_results"],
-        "messages": state["messages"],
+        "research_plan": state.get("research_plan", ""),
+        "search_queries": state.get("search_queries", []),
+        "search_results": state.get("search_results", ""),
+        "messages": state.get("messages", []),
     }
     markdown = generate_markdown(
         "Please review the search results and approve or provide feedback.", 
         snapshot, 
         diagram if diagram else "No image available"
     )
-    args = {"search_results": state["search_results"]}
+    args = {"search_results": state.get("search_results", [])}
     action_request = ActionRequest(action="Review Search Results", args=args)
     human_interrupt = HumanInterrupt(
         action_request=action_request,
@@ -198,23 +191,23 @@ async def confirm_search_results(state: GraphState):
     elif response.action == "ignore":
         pass
     elif response.action == "respond":
-        return {"search_results": response["args"]["search_results"]}
+        return {"search_results": response["args"]["args"]["search_results"]}
 
 async def confirm_summary(state: GraphState):
     snapshot = {
         "question": state["question"],
-        "research_plan": state["research_plan"],
-        "search_queries": state["search_queries"],
-        "search_results": state["search_results"],
-        "summary": state["summary"],
-        "messages": state["messages"],
+        "research_plan": state.get("research_plan", ""),
+        "search_queries": state.get("search_queries", []),
+        "search_results": state.get("search_results", ""),
+        "summary": state.get("summary", ""),
+        "messages": state.get("messages", []),
     }
     markdown = generate_markdown(
         "Please review the summary and approve or provide feedback.", 
         snapshot, 
         diagram if diagram else "No image available"
     )
-    args = {"summary": state["summary"]}
+    args = {"summary": state.get("summary", "")}
     action_request = ActionRequest(action="Review Summary", args=args)
     human_interrupt = HumanInterrupt(
         action_request=action_request,
@@ -227,9 +220,11 @@ async def confirm_summary(state: GraphState):
     elif response.action == "ignore":
         pass
     elif response.action == "respond":
-        return {"summary": response["args"]["summary"]}
+        return {"summary": response["args"]["args"]["summary"]}
 
 # ------------------------------------------------------------
+
+# Graph Definition
 graph = StateGraph(GraphState, input=InputState)
 
 graph.add_node("create_research_plan", create_research_plan)
@@ -252,9 +247,9 @@ graph.add_edge("confirm_search_results", "summarize_results")
 graph.add_edge("summarize_results", "confirm_summary")
 
 memory = AsyncSqliteSaver.from_conn_string(":memory:")
-graph.compile(checkpointer=memory)
+app = graph.compile(checkpointer=memory)
 
-image_bytes = graph.get_graph().draw_mermaid_png()
+image_bytes = app.get_graph().draw_mermaid_png()
 image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 image_data_uri = f"data:image/png;base64,{image_base64}"
 diagram = image_data_uri
