@@ -1,6 +1,6 @@
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from typing import List
-
+from typing import List 
+from langchain_core.documents import Document
 
 def get_research_plan_prompt(question: str):
     system = """
@@ -45,27 +45,28 @@ def get_search_query_prompts(research_plan: str):
     prompts = [SystemMessage(content=system), HumanMessage(content=user)]
     return prompts
 
-def get_search_assistant_prompt(search_queries: List[str]):
+def get_filter_assistant_prompt(query: str, results: List[Document]):
     system = """
-    You are an expert researcher. You have been given a list of search queries to execute. 
+    You are an expert researcher. You have been given a list of documents to filter.
 
-    Your job is to execute the search queries, and return the relevant results. 
-    You should use your best judgement to determine if the result is credible and relevant.
+    Your job is to filter the documents based on relevancy.
+    You should use your best judgement to determine if the document is relevant.
 
-    You have the following tools at your disposal:
-    - Web Search: This tool allows you to search the web for information.
-    - Filter by Relevance: This tool allows you to filter the results based on relevancy.
-    - Return Results: This tool allows you to return your results to the user.
+    You must use the following tool to filter the documents:
+    - Filter by Relevance: Call this tool to filter out irrelevant results. Use your best judgement to determine if the result is relevant. Requires a list of Documents as input.
     """
     user = """
-    Search Queries: 
-    {queries}
+    Query: 
+    {query}
+
+    Documnets: 
+    {documents}
     """
-    user = user.format(queries="\n".join(search_queries))
+    user = user.format(documents=results, query=query)
     prompts = [SystemMessage(content=system), HumanMessage(content=user)]
     return prompts
 
-def summarize_assistant_prompt(question: str, research_plan: str, results: List[str]):
+def summarize_assistant_prompt(question: str, research_plan: str, results: List[Document]):
     system = """
     You are an expert researcher. You have been given a list of results collected from a thorough research plan.
     The research plan was designed to answer a specific question. 
@@ -75,11 +76,12 @@ def summarize_assistant_prompt(question: str, research_plan: str, results: List[
 
     Research Plan: {research_plan}
 
-    Results: {results}
+    Results: {documents}
     """
     user = """
     Please summarize the results to answer the question in structured, systematic way.
     """
-    system = system.format(question=question, research_plan=research_plan, results="\n".join(results))
+    documents = "\n".join([doc.page_content for doc in results])
+    system = system.format(question=question, research_plan=research_plan, documents=documents)
     prompts = [SystemMessage(content=system), HumanMessage(content=user)]
     return prompts

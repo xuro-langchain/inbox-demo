@@ -1,3 +1,4 @@
+import operator
 import random 
 import base64
 import asyncio
@@ -11,22 +12,22 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_core.documents import Document
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages 
+from langgraph.graph.message import add_messages
+from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.interrupt import HumanInterruptConfig, HumanInterrupt, ActionRequest
-from langgraph.types import interrupt, Command
+from langgraph.types import interrupt, Command, Send
 
-
+from utils import add_or_reset
 from prompts import (
     get_research_plan_prompt, 
     get_search_query_prompts, 
-    get_search_assistant_prompt, 
+    get_filter_assistant_prompt, 
     summarize_assistant_prompt
 )
 from tools import (
     web_search_tool,
-    return_results,
-    filter_by_relevance
+    filter_by_relevance,
 )
 
 
@@ -35,8 +36,8 @@ load_dotenv(dotenv_path=".env", override=True)
 
 # Initialize LLM
 llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
-tools = [web_search_tool, return_results, filter_by_relevance]
-
+tools = [web_search_tool, filter_by_relevance]
+    
 class GraphState(TypedDict):
     """
     Represents the state of our graph.
@@ -44,11 +45,14 @@ class GraphState(TypedDict):
     question: str
     research_plan: str
     search_queries: list[str]
-    documents: list[Document]
+    documents: Annotated[list, add_or_reset]
     summary: str
     messages: Annotated[list, add_messages]
     error: str
     
+
+class FilterState(TypedDict):
+    query: str
 
 class InputState(TypedDict):
     question: str
@@ -58,7 +62,13 @@ async def create_research_plan(state: GraphState):
     question = state["question"]
     prompts = get_research_plan_prompt(question)
     llm_response = await llm.ainvoke(prompts)
-    return {"question": question, "research_plan": llm_response.content}
+    return {"question": question, 
+            "messages": [HumanMessage(content=question)], 
+            "research_plan": llm_response.content,
+            "search_trajectory": [],
+            "documents": [],
+            "summary": "",
+            "error": ""}
 # ------------------------------------------------------------
 
 # Search Query Creation Node
@@ -74,25 +84,50 @@ async def create_search_queries(state: GraphState):
     return {"search_queries": llm_response.queries}
 # ------------------------------------------------------------
 
-# Search Assistant with Tools
-async def search_assistant(state: GraphState):
+# Fan out for search query execution
+async def fanout_search_queries(state: GraphState):
     search_queries = state["search_queries"]
-    prompts = get_search_assistant_prompt(search_queries)
-    llm_with_tools = llm.bind_tools(tools)
-    llm_response = await llm_with_tools.ainvoke(prompts)
-    return {"search_results": llm_response.content}
+    return [Send("search_and_filter", {"query": query}) for query in search_queries]
 
-tool_node = ToolNode(tools)
+# Search and Filter Node
+async def search_and_filter(state: FilterState):
+    search_query = state["query"]
+    results = await web_search_tool.ainvoke({"query": search_query})
+    documents = []
+    for result in results:
+        content = result.get("content", "")
+        metadata = {
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "score": result.get("score", 0),
+            "source": "tavily_search"
+        }
+        doc = Document(page_content=content, metadata=metadata)
+        documents.append(doc)
+    prompts = get_filter_assistant_prompt(search_query, documents)
+    llm_with_tools = llm.bind_tools(tools, tool_choice="any", parallel_tool_calls=False)
+    llm_response = await llm_with_tools.ainvoke(prompts)
+
+    documents = []
+    if hasattr(llm_response, "tool_calls"):
+        if llm_response.tool_calls[0]["name"] == filter_by_relevance.name:
+            # Extract the arguments from the tool call
+            tool_args = llm_response.tool_calls[0]["args"]
+            # Call the tool with the arguments
+            result = await filter_by_relevance.ainvoke(tool_args)
+            documents.extend(result)
+    return {"documents": result}
+
 # ------------------------------------------------------------
 
 # Summarize Results Node
 async def summarize_results(state: GraphState):
     question = state["question"]
     research_plan = state["research_plan"]
-    results = state["search_results"]
+    results = state["documents"]
     prompts = summarize_assistant_prompt(question, research_plan, results)
     llm_response = await llm.ainvoke(prompts)
-    return {"summary": llm_response.content}
+    return {"summary": llm_response.content, "messages": [llm_response]}
 # ------------------------------------------------------------
 
 config = HumanInterruptConfig(
@@ -107,7 +142,8 @@ def generate_markdown(description: str, state: GraphState, diagram: str):
     # markdown += f"## Graph Diagram\n![Graph Diagram]({diagram})\n\n"
     markdown += f"## State Snapshot\n"
     for key, value in state.items():
-        markdown += f"### {key}\n{value}\n"
+        if key != "documents":
+            markdown += f"### {key}\n{value}\n"
     return markdown
 
 # Interrupt Nodes
@@ -131,11 +167,11 @@ async def confirm_research_plan(state: GraphState):
         description=markdown
     )
     response = interrupt(human_interrupt)[0]
-    if response.action == "accept":
+    if response["type"] == "accept":
         pass
-    elif response.action == "ignore":
+    elif response["type"] == "ignore":
         pass
-    elif response.action == "respond":
+    elif response["type"] == "edit":
         return {"research_plan": response["args"]["args"]["research_plan"]}
 
 async def confirm_search_queries(state: GraphState):
@@ -158,11 +194,11 @@ async def confirm_search_queries(state: GraphState):
         description=markdown
     )
     response = interrupt(human_interrupt)[0]
-    if response.action == "accept":
+    if response["type"] == "accept":
         pass
-    elif response.action == "ignore":
+    elif response["type"] == "ignore":
         pass
-    elif response.action == "respond":
+    elif response["type"] == "edit":
         return {"search_queries": response["args"]["args"]["search_queries"]}
 
 async def confirm_search_results(state: GraphState):
@@ -170,7 +206,7 @@ async def confirm_search_results(state: GraphState):
         "question": state["question"],
         "research_plan": state.get("research_plan", ""),
         "search_queries": state.get("search_queries", []),
-        "search_results": state.get("search_results", ""),
+        "documents": state.get("documents", []),
         "messages": state.get("messages", []),
     }
     markdown = generate_markdown(
@@ -178,7 +214,7 @@ async def confirm_search_results(state: GraphState):
         snapshot, 
         diagram if diagram else "No image available"
     )
-    args = {"search_results": state.get("search_results", [])}
+    args = {"documents": state.get("documents", [])}
     action_request = ActionRequest(action="Review Search Results", args=args)
     human_interrupt = HumanInterrupt(
         action_request=action_request,
@@ -186,19 +222,20 @@ async def confirm_search_results(state: GraphState):
         description=markdown
     )
     response = interrupt(human_interrupt)[0]
-    if response.action == "accept": 
+    print(response)
+    if response["type"] == "accept": 
         pass
-    elif response.action == "ignore":
+    elif response["type"] == "ignore":
         pass
-    elif response.action == "respond":
-        return {"search_results": response["args"]["args"]["search_results"]}
+    elif response["type"] == "edit":
+        return {"documents": response["args"]["args"]["documents"]}
 
 async def confirm_summary(state: GraphState):
     snapshot = {
         "question": state["question"],
         "research_plan": state.get("research_plan", ""),
         "search_queries": state.get("search_queries", []),
-        "search_results": state.get("search_results", ""),
+        "documents": state.get("documents", []),
         "summary": state.get("summary", ""),
         "messages": state.get("messages", []),
     }
@@ -215,11 +252,11 @@ async def confirm_summary(state: GraphState):
         description=markdown
     )
     response = interrupt(human_interrupt)[0]
-    if response.action == "accept":
+    if response["type"] == "accept":
         pass
-    elif response.action == "ignore":
+    elif response["type"] == "ignore":
         pass
-    elif response.action == "respond":
+    elif response["type"] == "edit":
         return {"summary": response["args"]["args"]["summary"]}
 
 # ------------------------------------------------------------
@@ -229,7 +266,7 @@ graph = StateGraph(GraphState, input=InputState)
 
 graph.add_node("create_research_plan", create_research_plan)
 graph.add_node("create_search_queries", create_search_queries)
-graph.add_node("search_assistant", search_assistant)
+graph.add_node("search_and_filter", search_and_filter)
 graph.add_node("summarize_results", summarize_results)
 
 graph.add_node("confirm_research_plan", confirm_research_plan)
@@ -240,9 +277,11 @@ graph.add_node("confirm_summary", confirm_summary)
 graph.add_edge(START, "create_research_plan")
 graph.add_edge("create_research_plan", "confirm_research_plan")
 graph.add_edge("confirm_research_plan", "create_search_queries")
+
 graph.add_edge("create_search_queries", "confirm_search_queries")
-graph.add_edge("confirm_search_queries", "search_assistant")
-graph.add_edge("search_assistant", "confirm_search_results")
+graph.add_conditional_edges("confirm_search_queries", fanout_search_queries, ["search_and_filter"])
+
+graph.add_edge("search_and_filter", "confirm_search_results")
 graph.add_edge("confirm_search_results", "summarize_results")
 graph.add_edge("summarize_results", "confirm_summary")
 
